@@ -57,5 +57,5 @@ def extract_frames_from_videos(input_dir, output_dir, frame_interval=5):
     print(f"\n✅ Finished processing {label} directory")
 
 if __name__ == '__main__':
-    extract_frames_from_videos("/content/FF++/real", "/content/MesoXAI/processed_data", frame_interval=5)
-    extract_frames_from_videos("/content/FF++/fake", "/content/MesoXAI/processed_data", frame_interval=5)
+    extract_frames_from_videos("/content/DFD/real", "/content/MesoXAI/processed_data", frame_interval=5)
+    extract_frames_from_videos("/content/DFD/fake", "/content/MesoXAI/processed_data", frame_interval=5)
