@@ -18,8 +18,15 @@ def extract_frames_from_videos(input_dir, output_dir, frame_interval=5):
         return
 
     print(f"\n🎞️ Processing {label} videos:")
-    for video_path in tqdm(video_paths, desc=f"Processing {label} videos"):        
+    for video_path in tqdm(video_paths, desc=f"Processing {label} videos"):
         video_name = extract_video_name(video_path)
+
+        # ✅ Skip if frames for this video already exist
+        existing_frames = [f for f in os.listdir(save_dir) if f.startswith(video_name)]
+        if len(existing_frames) >= 5:  # You can change this threshold
+            print(f"⏩ Skipping {video_name}: frames already extracted ({len(existing_frames)} found)")
+            continue
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"⚠️ Unable to open video: {video_path}")
