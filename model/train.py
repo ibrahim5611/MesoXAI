@@ -1,98 +1,205 @@
 # /MesoXAI/model/train.py
 
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, datasets
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from model.mesonet import Meso4
 from tqdm import tqdm
 from datetime import datetime
-from mesonet import Meso4
+from sklearn.metrics import (confusion_matrix, accuracy_score, precision_score,
+                             recall_score, f1_score, roc_auc_score,
+                             roc_curve, precision_recall_curve)
 
-# Configuration
-DATA_DIR = "../processed_data"
-REAL_DIR = os.path.join(DATA_DIR, "real_frames")
-FAKE_DIR = os.path.join(DATA_DIR, "fake_frames")
-WEIGHTS_DIR = "../weights"
-BATCH_SIZE = 32
-EPOCHS = 10
-LR = 0.001
-IMG_SIZE = 256
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from utils.early_stopping import EarlyStopping
 
-os.makedirs(WEIGHTS_DIR, exist_ok=True)
+from PIL import Image
 
-# Custom Dataset
-class DeepfakeDataset(Dataset):
-    def __init__(self, real_dir, fake_dir, transform=None):
-        self.real_images = [os.path.join(real_dir, img) for img in os.listdir(real_dir)]
-        self.fake_images = [os.path.join(fake_dir, img) for img in os.listdir(fake_dir)]
-        self.images = self.real_images + self.fake_images
-        self.labels = [0] * len(self.real_images) + [1] * len(self.fake_images)
-        self.transform = transform
+misclassified_dir = "/content/MesoXAI/misclassified"
+os.makedirs(misclassified_dir, exist_ok=True)
 
-    def __len__(self):
-        return len(self.images)
+cm_save_path = "/content/MesoXAI/eval/"
+os.makedirs(cm_save_path, exist_ok=True)
 
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        image = datasets.folder.default_loader(img_path)
-        label = self.labels[idx]
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+roc_pr_dir = "/content/MesoXAI/eval/curves"
+os.makedirs(roc_pr_dir, exist_ok=True)
 
-# Transforms
-transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-])
 
-# Dataset & DataLoader
-dataset = DeepfakeDataset(REAL_DIR, FAKE_DIR, transform)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Model, Loss, Optimizer
-model = Meso4()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+def load_existing_weights(model, weight_path):
+    if os.path.exists(weight_path):
+        print(f"🧠 Loading existing weights from {weight_path}")
+        existing_state = torch.load(weight_path)
+        model.load_state_dict(existing_state, strict=False)
+    return model
 
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
+def save_combined_weights(model, old_path, new_path):
+    if os.path.exists(old_path):
+        old_weights = torch.load(old_path)
+        new_weights = model.state_dict()
+        combined_weights = {}
+        for key in new_weights:
+            if key in old_weights:
+                combined_weights[key] = (new_weights[key] + old_weights[key]) / 2
+            else:
+                combined_weights[key] = new_weights[key]
+        torch.save(combined_weights, new_path)
+        print(f"💾 Combined weights saved to {new_path}")
+    else:
+        torch.save(model.state_dict(), new_path)
+        print(f"💾 Model weights saved to {new_path} (initial save)")
 
-# Training Loop
-for epoch in range(EPOCHS):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+def plot_and_save_confusion_matrix(y_true, y_pred, save_path):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Real', 'Fake'], yticklabels=['Real', 'Fake'])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.savefig(os.path.join(save_path, 'confusion_matrix.png'))
+    plt.close()
 
-    loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
-    for inputs, labels in loop:
-        inputs, labels = inputs.to(device), labels.to(device).float().unsqueeze(1)
+def save_roc_pr_curves(y_true, y_probs):
+    fpr, tpr, _ = roc_curve(y_true, y_probs)
+    precision, recall, _ = precision_recall_curve(y_true, y_probs)
 
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
+    plt.figure()
+    plt.plot(fpr, tpr, label='ROC Curve')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend()
+    plt.savefig(os.path.join(roc_pr_dir, 'roc_curve.png'))
+    plt.close()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    plt.figure()
+    plt.plot(recall, precision, label='PR Curve')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend()
+    plt.savefig(os.path.join(roc_pr_dir, 'pr_curve.png'))
+    plt.close()
 
-        running_loss += loss.item()
-        preds = torch.sigmoid(outputs) > 0.5
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+def save_misclassified_samples(images, labels, preds, paths):
+    for img, label, pred, path in zip(images, labels, preds, paths):
+        if int(pred) != int(label):
+            img_np = img.permute(1, 2, 0).cpu().numpy() * 255
+            img_pil = Image.fromarray(img_np.astype(np.uint8))
+            base_name = os.path.basename(path)
+            img_pil.save(os.path.join(misclassified_dir, f"{label}_{pred}_{base_name}"))
 
-        loop.set_postfix(loss=loss.item(), acc=100 * correct / total)
+def compute_metrics(y_true, y_pred_probs):
+    y_pred = (y_pred_probs >= 0.5).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    auc = roc_auc_score(y_true, y_pred_probs)
 
-    epoch_loss = running_loss / len(dataloader)
-    epoch_acc = 100 * correct / total
-    print(f"Epoch [{epoch+1}/{EPOCHS}] - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+    tn, fp, fn, tp = cm.ravel()
+    tpr = tp / (tp + fn + 1e-8)
+    fpr = fp / (fp + tn + 1e-8)
+    tnr = tn / (tn + fp + 1e-8)
+    fnr = fn / (fn + tp + 1e-8)
+    weighted_prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
 
-    # Save model with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    weight_path = os.path.join(WEIGHTS_DIR, f"mesonet_model_{timestamp}.pth")
-    torch.save(model.state_dict(), weight_path)
-    print(f"Saved weights: {weight_path}")
+    print(f"\n📊 Confusion Matrix: \n{cm}")
+    print(f"🎯 Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1 Score: {f1:.4f}")
+    print(f"📈 AUC: {auc:.4f}")
+    print(f"🔍 TPR: {tpr:.4f} | FPR: {fpr:.4f} | TNR: {tnr:.4f} | FNR: {fnr:.4f}")
+    print(f"📌 Weighted Precision: {weighted_prec:.4f}")
 
-print("Training Complete.")
+    plot_and_save_confusion_matrix(y_true, y_pred, cm_save_path)
+    save_roc_pr_curves(y_true, y_pred_probs)
+
+def train_model():
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
+
+    dataset_path = '/content/MesoXAI/processed_data_split'
+    train_dataset = datasets.ImageFolder(os.path.join(dataset_path, 'train'), transform=transform)
+    val_dataset = datasets.ImageFolder(os.path.join(dataset_path, 'val'), transform=transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+    model = Meso4().to(device)
+    weight_path = "/content/MesoXAI/weights/mesonet_model.pth"
+    model = load_existing_weights(model, weight_path)
+
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    best_val_loss = float('inf')
+    num_epochs = 30
+    early_stopper = EarlyStopping(patience=3, verbose=True, delta=0.001)
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+
+        for images, labels in loop:
+            images = images.to(device)
+            labels = labels.float().unsqueeze(1).to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+
+        avg_loss = running_loss / len(train_loader)
+        print(f"📉 Epoch {epoch+1} - Avg Training Loss: {avg_loss:.4f}")
+
+        model.eval()
+        val_loss = 0.0
+        all_preds = []
+        all_labels = []
+        val_paths = []
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.float().unsqueeze(1).to(device)
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+
+                all_preds.extend(outputs.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"✅ Epoch {epoch+1} - Validation Loss: {avg_val_loss:.4f}")
+
+        all_preds_np = np.array(all_preds).flatten()
+        all_labels_np = np.array(all_labels).flatten()
+        compute_metrics(all_labels_np, all_preds_np)
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            save_combined_weights(model, weight_path, weight_path)
+
+        early_stopper(avg_val_loss, model)
+        if early_stopper.early_stop:
+            print("⏹️ Early stopping triggered!")
+            break
+
+if __name__ == "__main__":
+    train_model()
