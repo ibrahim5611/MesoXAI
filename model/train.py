@@ -203,3 +203,7 @@ def train_model():
 
 if __name__ == "__main__":
     train_model()
+    print("✅ Training completed.")
+    print(f"📁 Model weights saved to {weight_path}")
+    print(f"📁 Misclassified samples saved to {misclassified_dir}")
+    print(f"📁 Confusion matrix and curves saved to {cm_save_path}")

@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
 
-class DeepfakeDataset(Dataset):
+class DeepFakeDataset(Dataset):
     def __init__(self, real_dir, fake_dir, transform=None):
         self.real_dir = real_dir
         self.fake_dir = fake_dir
